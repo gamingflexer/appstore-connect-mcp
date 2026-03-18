@@ -1,5 +1,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import express from 'express';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema
@@ -18,6 +20,7 @@ import { ServerConfig } from '../types/config.js';
 
 export class AppStoreMCPServer {
   private server: Server;
+  private config: ServerConfig;
   private auth: JWTManager;
   private client: AppStoreClient;
   private appService: AppService;
@@ -29,6 +32,7 @@ export class AppStoreMCPServer {
   private subscriptionService: SubscriptionService;
 
   constructor(config: ServerConfig) {
+    this.config = config;
     // Initialize server
     this.server = new Server(
       {
@@ -329,10 +333,17 @@ export class AppStoreMCPServer {
       
       // Financial tools
       case 'get_sales_report':
-        return await this.financeService.getSalesReport({
-          date: args.date,
-          reportType: args.reportType
-        });
+        try {
+          return await this.financeService.getSalesReport({
+            date: args.date,
+            reportType: args.reportType
+          });
+        } catch (error: any) {
+          if (error.message.toLowerCase().includes('no sales') || error.message.includes('not found')) {
+            return { rows: [], rowCount: 0, summary: `No sales data for ${args.date || 'requested date'}. Try a different date or use get_monthly_revenue for aggregated data.` };
+          }
+          throw error;
+        }
       
       case 'get_revenue_metrics':
         // Use FINANCIAL reports for complete revenue (includes renewals)
@@ -361,7 +372,14 @@ export class AppStoreMCPServer {
         }
       
       case 'get_subscription_metrics':
-        return await this.financeService.getSubscriptionMetrics();
+        try {
+          return await this.financeService.getSubscriptionMetrics();
+        } catch (error: any) {
+          if (error.message.toLowerCase().includes('invalid vendor') || error.message.includes('400')) {
+            return { summary: 'Subscription metrics not available via Sales Reports for this account. Use get_monthly_revenue or get_subscription_renewals instead.' };
+          }
+          throw error;
+        }
       
       case 'get_monthly_revenue':
         if (!args.year || !args.month) {
@@ -458,7 +476,45 @@ export class AppStoreMCPServer {
   }
 
   async start() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+    const port = process.env.PORT;
+    if (port) {
+      await this.startSSE(parseInt(port));
+    } else {
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+    }
+  }
+
+  private async startSSE(port: number) {
+    const app = express();
+    // Map of session ID → transport for active SSE connections
+    const sessions = new Map<string, SSEServerTransport>();
+
+    app.get('/sse', async (req, res) => {
+      // Create a fresh server + transport per connection to avoid "Already connected" error
+      const sessionServer = new AppStoreMCPServer(this.config);
+      const transport = new SSEServerTransport('/message', res);
+      sessions.set(transport.sessionId, transport);
+
+      res.on('close', () => {
+        sessions.delete(transport.sessionId);
+      });
+
+      await sessionServer.server.connect(transport);
+    });
+
+    app.post('/message', async (req, res) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = sessions.get(sessionId);
+      if (!transport) {
+        res.status(404).send('Session not found');
+        return;
+      }
+      await transport.handlePostMessage(req, res);
+    });
+
+    app.listen(port, '0.0.0.0', () => {
+      process.stderr.write(`App Store Connect MCP SSE server listening on port ${port}\n`);
+    });
   }
 }
